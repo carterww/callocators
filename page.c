@@ -13,6 +13,7 @@
 // Probably inefficient, we should cache this value
 #define PAGE_SIZE getpagesize()
 #define STATIC_PAGE_HEAD_NUM 32
+#define MAX_PAGES_FREE_LIST 16
 
 struct palloc_page_head {
 	struct dlink head;
@@ -22,7 +23,6 @@ struct palloc_page_head {
 
 struct __internal_page {
 	size_t page_heads_cap;
-	size_t page_heads_num;
 	struct dlink head;
 	struct palloc_page_head *pages;
 };
@@ -32,9 +32,9 @@ struct palloc_state {
 	struct dlink __head;
 	struct dlink free_head;
 	struct dlink used_head;
+	size_t free_page_num;
 };
 
-static size_t initial_free_page_num = 4;
 static struct palloc_page_head static_page_heads[STATIC_PAGE_HEAD_NUM] = { 0 };
 // TODO: maybe make this per thread. We'll see if global
 // locking impacts performance significantly
@@ -43,16 +43,19 @@ static struct palloc_state state = {
 	.__head = DLIST_INIT(state.__head),
 	.free_head = DLIST_INIT(state.free_head),
 	.used_head = DLIST_INIT(state.used_head),
+	.free_page_num = 0,
 };
 static struct __internal_page static_internal_page = {
 	.page_heads_cap = STATIC_PAGE_HEAD_NUM,
-	.page_heads_num = 0,
 	.head = { 0 },
 	.pages = static_page_heads,
 };
 
 static void __c_die(const char *str);
 static void *find_free_pages(size_t pnum, struct palloc_page_head *extra);
+static struct palloc_page_head *find_free_page_head();
+static struct __internal_page *
+find_page_head_container(struct palloc_page_head *head);
 static void *__map_pages(size_t pnum);
 static void __unmap_pages(void *addr, size_t len);
 
@@ -69,11 +72,10 @@ void *palloc(size_t pnum)
 	if (&state.__head == state.__head.next) {
 		dlist_add(&static_internal_page.head, &state.__head);
 	}
-	struct __internal_page *__page =
-		list_entry(state.__head.next, struct __internal_page, head);
-	// Static "page" not added to linked list yet
-	// Current internal page is full, need to get another
-	if (__page->page_heads_cap == __page->page_heads_num) {
+	struct __internal_page *__page;
+	struct palloc_page_head *free_head = find_free_page_head();
+	// No free slots
+	if (free_head == NULL) {
 		// Cannot pass NULL extra because we have no room in
 		// internal pages for a split head
 		struct palloc_page_head extra = { 0 };
@@ -81,25 +83,22 @@ void *palloc(size_t pnum)
 		__page->page_heads_cap =
 			(PAGE_SIZE - sizeof(struct __internal_page)) /
 			sizeof(struct palloc_page_head);
-		__page->page_heads_num = 0;
 		char *pages_offset =
 			(char *)__page + sizeof(struct __internal_page);
 		__page->pages = (struct palloc_page_head *)pages_offset;
 		dlist_add(&__page->head, &state.__head);
+		size_t start = 0;
 		if (extra.addr != NULL) {
-			__page->pages[0] = extra;
-			__page->page_heads_num = 1;
+			__page->pages[start++] = extra;
 		}
+		free_head = &__page->pages[start];
 	}
 	// extra is NULL becaue we have at least one slot in current internal
 	// page for a palloc_page_head
 	void *pages = find_free_pages(pnum, NULL);
-	struct palloc_page_head *new_head =
-		__page->pages + __page->page_heads_num;
-	++__page->page_heads_num;
-	dlist_add(&new_head->head, &state.used_head);
-	new_head->addr = pages;
-	new_head->page_num = pnum;
+	dlist_add(&free_head->head, &state.used_head);
+	free_head->addr = pages;
+	free_head->page_num = pnum;
 	pthread_mutex_unlock(&state.lock);
 
 	return pages;
@@ -111,20 +110,47 @@ void pfree(void *pages)
 	pages = (void *)((uintptr_t)pages & ~(PAGE_SIZE - 1));
 	int found = 0;
 	struct palloc_page_head *entry;
+	pthread_mutex_lock(&state.lock);
 	list_for_each(&state.used_head, entry, struct palloc_page_head, head) {
-		printf("param: %p, entry: %p\n", pages, entry->addr);
 		if (entry->addr == pages) {
 			found = 1;
 			break;
 		}
 	}
 	if (found == 0) {
-		// For debugging
-		__c_die("Tried to free page not managed by palloc");
+		return;
 	}
-	// For now, we'll ignore freeing palloc_page_head from internal pages
 	dlist_del(&entry->head);
+	if (state.free_page_num <= MAX_PAGES_FREE_LIST) {
+		state.free_page_num += entry->page_num;
+		dlist_add(&entry->head, &state.free_head);
+		memset(pages, 0, PAGE_SIZE * entry->page_num);
+		pthread_mutex_unlock(&state.lock);
+		return;
+	}
+	entry->addr = NULL;
+	struct __internal_page *container = find_page_head_container(entry);
+	int should_free_container = 1;
+	// Check if internal page is empty only if it isn't static page.
+	// If all palloc_page_head spots are full, unmap the page
+	if (container != &static_internal_page) {
+		struct palloc_page_head *curr = container->pages;
+		while (curr < container->pages + container->page_heads_cap) {
+			if (curr->addr != NULL) {
+				should_free_container = 0;
+				break;
+			}
+			++curr;
+		}
+		if (should_free_container) {
+			dlist_del(&container->head);
+		}
+	}
+	pthread_mutex_unlock(&state.lock);
 	__unmap_pages(entry->addr, entry->page_num * PAGE_SIZE);
+	if (should_free_container) {
+		__unmap_pages(container, PAGE_SIZE);
+	}
 }
 
 // Find pages in free list or by allocating new ones
@@ -145,6 +171,7 @@ static void *find_free_pages(size_t pnum, struct palloc_page_head *extra)
 	} else if (entry->page_num == pnum) {
 		dlist_del(&entry->head);
 		dlist_add(&entry->head, &state.used_head);
+		state.free_page_num -= entry->page_num;
 		return entry->addr;
 	}
 
@@ -156,14 +183,49 @@ static void *find_free_pages(size_t pnum, struct palloc_page_head *extra)
 	if (extra == NULL) {
 		struct __internal_page *__page = list_entry(
 			&state.__head.next, struct __internal_page, head);
-		extra = &__page->pages[__page->page_heads_num++];
+		extra = find_free_page_head();
 	}
 	extra->page_num = entry->page_num - pnum;
 	extra->addr = entry->addr + (PAGE_SIZE * pnum);
 	entry->page_num = pnum;
 	dlist_del(&entry->head);
 	dlist_add(&entry->head, &state.used_head);
+	state.free_page_num -= pnum;
 	return entry->addr;
+}
+
+static struct palloc_page_head *find_free_page_head()
+{
+	struct __internal_page *entry;
+	list_for_each(&state.__head, entry, struct __internal_page, head) {
+		struct palloc_page_head *curr = entry->pages;
+		while (curr < entry->page_heads_cap + entry->pages) {
+			if (curr->addr != NULL) {
+				++curr;
+				continue;
+			}
+			return curr;
+		}
+	}
+	return NULL;
+}
+
+static struct __internal_page *
+find_page_head_container(struct palloc_page_head *head)
+{
+	struct __internal_page *entry;
+	list_for_each(&state.__head, entry, struct __internal_page, head) {
+		struct palloc_page_head *last =
+			entry->pages + entry->page_heads_cap;
+		uintptr_t end = (uintptr_t)last;
+		uintptr_t start = (uintptr_t)entry;
+		uintptr_t item = (uintptr_t)head;
+		if (item < end && item > start) {
+			return entry;
+		}
+	}
+	__c_die("Finding containing internal page failed");
+	return NULL;
 }
 
 static void *__map_pages(size_t pnum)
