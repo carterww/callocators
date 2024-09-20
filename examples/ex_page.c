@@ -1,4 +1,5 @@
 #include "page.h"
+#include <stdio.h>
 
 int main()
 {
@@ -7,6 +8,7 @@ int main()
 		void *page = palloc(1);
 		int *a = (int *)page;
 		*a = 5;
+		printf("%d\n", i);
 		pfree(page);
 		++i;
 	}
