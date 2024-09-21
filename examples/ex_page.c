@@ -8,7 +8,7 @@ int main()
 		void *page = palloc(1);
 		int *a = (int *)page;
 		*a = 5;
-		printf("%d\n", i);
+		printf("%d -> %p\n", i, page);
 		pfree(page);
 		++i;
 	}
