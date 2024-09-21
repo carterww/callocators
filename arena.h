@@ -2,12 +2,13 @@
 #define _ARENA_H
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include "kette.h"
 
 struct arena_page {
-	size_t idx;
-	size_t end;
+	uintptr_t idx;
+	uintptr_t end;
 	struct slink pages_head;
 };
 
