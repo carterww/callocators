@@ -7,6 +7,9 @@
 #define INITIAL_BYTES_DEFAULT page_size()
 #define BYTES_GROWTH_DEFAULT page_size()
 
+static void arena_page_init(struct arena *arena, struct arena_page *page,
+			    size_t struct_size, size_t page_size);
+static void *alloc_in_page(struct arena_page *page, size_t bytes);
 static size_t bytes_to_page(size_t bytes, int page_size);
 
 struct arena *arena_create()
@@ -22,25 +25,19 @@ struct arena *arena_create_ext(size_t initial_bytes, size_t bytes_growth)
 	if (a == NULL) {
 		return NULL;
 	}
-	uintptr_t start = (uintptr_t)a;
 	slist_init(&a->head);
 	a->bytes_growth = bytes_growth;
-	a->page.idx = start + sizeof(*a);
-	a->page.end = start + (num_pages * ps);
-	slist_add(&a->page.pages_head, &a->head);
+	arena_page_init(a, &a->page, sizeof(*a), num_pages * ps);
 	return a;
 }
 
 void *arena_alloc(struct arena *arena, size_t bytes)
 {
-	void *ptr = NULL;
 	struct arena_page *curr_page =
 		list_entry(arena->head.next, struct arena_page, pages_head);
 	size_t bytes_left = curr_page->end - curr_page->idx - 1;
 	if (bytes <= bytes_left) {
-		ptr = (void *)curr_page->idx;
-		curr_page->idx += bytes;
-		return ptr;
+		return alloc_in_page(curr_page, bytes);
 	}
 	size_t growth = bytes >= arena->bytes_growth ? bytes :
 						       arena->bytes_growth;
@@ -50,13 +47,8 @@ void *arena_alloc(struct arena *arena, size_t bytes)
 	if (curr_page == NULL) {
 		return NULL;
 	}
-	uintptr_t start = (uintptr_t)curr_page;
-	curr_page->idx = start + sizeof(*curr_page);
-	curr_page->end = start + (num_pages * ps);
-	slist_add(&curr_page->pages_head, &arena->head);
-	ptr = (void *)curr_page->idx;
-	curr_page->idx += bytes;
-	return ptr;
+	arena_page_init(arena, curr_page, sizeof(*curr_page), num_pages * ps);
+	return alloc_in_page(curr_page, growth);
 }
 
 void arena_free(struct arena *arena)
@@ -71,6 +63,22 @@ void arena_free(struct arena *arena)
 		}
 	}
 	pfree(free_last);
+}
+
+static void arena_page_init(struct arena *arena, struct arena_page *page,
+			    size_t struct_size, size_t page_size)
+{
+	uintptr_t start = (uintptr_t)page;
+	page->idx = start + struct_size;
+	page->end = start + page_size;
+	slist_add(&page->pages_head, &arena->head);
+}
+
+static void *alloc_in_page(struct arena_page *page, size_t bytes)
+{
+	void *ptr = (void *)page->idx;
+	page->idx += bytes;
+	return ptr;
 }
 
 static size_t bytes_to_page(size_t bytes, int ps)

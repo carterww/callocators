@@ -4,12 +4,12 @@
 #ifdef _COMPILE_ASSERTS
 #include <stdio.h>
 #include <stdlib.h>
-#define assert(expr)                                                       \
+#define _assert(expr)                                                      \
 	if (unlikely(!(expr))) {                                           \
 		fprintf(stderr, "ERR: assert failed at %s:%d\n", __FILE__, \
 			__LINE__);                                         \
 		exit(1);                                                   \
 	}
 #else
-#define assert(expr)
+#define _assert(expr)
 #endif

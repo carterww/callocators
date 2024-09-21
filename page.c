@@ -2,6 +2,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -19,6 +20,9 @@ int page_size()
 	}
 	return _page_size;
 }
+
+// Kill application if we are in unreachable state
+void __unreachable(const char *str);
 
 // Number of palloc_page_heads to store statically. This avoids internal
 // fragmentation of internal pages for users with a small number of allocations.
@@ -132,7 +136,7 @@ static struct palloc_state state = {
 };
 
 static void *find_free_pages(size_t pnum, struct palloc_page_head *extra);
-static struct palloc_page_head *find_free_page_head();
+static struct palloc_page_head *get_free_page_head();
 
 // Find the internal page head is stored in
 static struct __internal_page *
@@ -148,9 +152,6 @@ static struct __internal_page *find_internal_page_to_free();
 static void *__map_pages(size_t pnum);
 static void __unmap_pages(void *addr, size_t len);
 
-// Kill application. Used for debugging
-static void __c_die(const char *str);
-
 void *palloc(size_t pnum)
 {
 	if (pnum == 0) {
@@ -163,7 +164,7 @@ void *palloc(size_t pnum)
 		dlist_add(&static_internal_page->head, &state.__head);
 	}
 	struct __internal_page *__page;
-	struct palloc_page_head *free_head = find_free_page_head();
+	struct palloc_page_head *free_head = get_free_page_head();
 	if (free_head != NULL) {
 		__page = find_page_head_container(free_head);
 	} else {
@@ -181,11 +182,12 @@ void *palloc(size_t pnum)
 		if (extra.addr != NULL) {
 			pages[__page->page_heads_num++] = extra;
 		}
-		free_head = &pages[__page->page_heads_num];
+		free_head = &pages[__page->page_heads_num++];
 	}
+	_assert(__page != NULL);
+	_assert(free_head != NULL);
 	// Mark the internal page as used recently
 	__use_internal_page(__page);
-	++__page->page_heads_num;
 	// extra is NULL becaue we have at least one slot in current internal
 	// page for a palloc_page_head
 	void *pages = find_free_pages(pnum, NULL);
@@ -270,7 +272,7 @@ static void *find_free_pages(size_t pnum, struct palloc_page_head *extra)
 	// null, the caller is trying to find an internal page, so we
 	// must put the split palloc_page_head in extra.
 	if (extra == NULL) {
-		extra = find_free_page_head();
+		extra = get_free_page_head();
 	}
 	extra->page_num = entry->page_num - pnum;
 	extra->addr = entry->addr + (page_size() * pnum);
@@ -281,7 +283,7 @@ static void *find_free_pages(size_t pnum, struct palloc_page_head *extra)
 	return entry->addr;
 }
 
-static struct palloc_page_head *find_free_page_head()
+static struct palloc_page_head *get_free_page_head()
 {
 	struct __internal_page *entry;
 	list_for_each(&state.__head, entry, struct __internal_page, head) {
@@ -316,7 +318,10 @@ find_page_head_container(struct palloc_page_head *head)
 			return entry;
 		}
 	}
-	__c_die("Finding containing internal page failed");
+	static char msgWithPtr[64];
+	snprintf(msgWithPtr, 64, "Failed to find __internal_page for %p\n",
+		 head);
+	__unreachable(msgWithPtr);
 	return NULL;
 }
 
@@ -336,20 +341,19 @@ static struct __internal_page *find_internal_page_to_free()
 
 static void *__map_pages(size_t pnum)
 {
-	assert(pnum != 0);
+	_assert(pnum != 0);
 	void *raw_pages = mmap(NULL, pnum * page_size(), PROT_READ | PROT_WRITE,
 			       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	// Die for now on error
-	if (raw_pages == MAP_FAILED) {
-		__c_die("Failed to boostrap page allocator");
-	}
+	// Fail for now. In the future, we should return NULL and allow caller
+	// to attempt to find free memory. If that fails, caller can return NULL
+	_assert(raw_pages != MAP_FAILED);
 	return raw_pages;
 }
 
 static void __unmap_pages(void *addr, size_t len)
 {
-	assert(addr != 0);
-	assert(len != 0);
+	_assert(addr != 0);
+	_assert(len != 0);
 	int err = munmap(addr, len);
 	if (err != 0) {
 		perror(NULL);
@@ -357,7 +361,7 @@ static void __unmap_pages(void *addr, size_t len)
 	}
 }
 
-static void __c_die(const char *str)
+void __unreachable(const char *str)
 {
 	size_t len = strnlen(str, 512);
 	int print_nl = 1;
